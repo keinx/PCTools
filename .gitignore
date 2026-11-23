@@ -1,0 +1,16 @@
+PCToolsAI.sqlite
+PCToolsAI.sqlite-wal
+PCToolsAI.sqlite-shm
+PCToolsAI.sqlite-journal
+PCToolsAI.sqlite.tmp
+
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite.tmp
+
+PCTools.exe
+PCToolsDiag.exe
+
+.workbuddy/
+.codex/
