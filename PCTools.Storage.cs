@@ -41,18 +41,61 @@ namespace PCTools
         private static readonly object gate = new object();
         private static string path;
         private static int writes;
+        // 默认始终保留最近 200 条「被吞掉的异常」摘要（只在内存，不做 IO）：
+        // 出问题时能随错误日志一起落盘。以前默认零日志，139 处静默 catch 让
+        // 「列表莫名少了几项」完全无从排查
+        private static readonly Queue<string> ring = new Queue<string>(256);
+        private static readonly object ringGate = new object();
 
         internal static void Swallow(string where, Exception ex)
         {
-            if (!enabled || ex == null) return;
-            Append(where + " : " + ex.GetType().Name + " - " + ex.Message);
+            if (ex == null) return;
+            string line = where + " : " + ex.GetType().Name + " - " + ex.Message;
+            Remember(line);
+            if (!enabled) return;
+            Append(line);
         }
 
         // 非异常类诊断信息（如 sqlite 返回码），同样只在 PCTOOLS_LOG=1 时落盘
         internal static void Note(string text)
         {
-            if (!enabled || string.IsNullOrEmpty(text)) return;
+            if (string.IsNullOrEmpty(text)) return;
+            Remember(text);
+            if (!enabled) return;
             Append(text);
+        }
+
+        private static void Remember(string text)
+        {
+            try
+            {
+                lock (ringGate)
+                {
+                    if (ring.Count >= 200) ring.Dequeue();
+                    ring.Enqueue(DateTime.Now.ToString("HH:mm:ss") + "  " + text);
+                }
+            }
+            catch { }
+        }
+
+        // 最近若干条摘要：UI 异常/致命错误写日志时一并带上，便于定位「之前发生过什么」
+        internal static string Recent(int max)
+        {
+            try
+            {
+                lock (ringGate)
+                {
+                    if (ring.Count == 0) return "";
+                    StringBuilder sb = new StringBuilder();
+                    foreach (string s in ring)
+                    {
+                        if (max-- <= 0) break;
+                        sb.AppendLine(s);
+                    }
+                    return sb.ToString();
+                }
+            }
+            catch { return ""; }
         }
 
         private static void Append(string text)
@@ -214,13 +257,15 @@ namespace PCTools
             string localDb = Path.Combine(local, "PCToolsAI.sqlite");
             bool sameDir = string.Equals(local, exeDir, StringComparison.OrdinalIgnoreCase);
             // exe 放在网络共享时 SQLite 会直接在 SMB 上读写：断线/多会话可能损坏库，
-            // 且每次 stat 都要过网络。强制回退到本机 LocalAppData
-            bool uncExe = exeDir.StartsWith(@"\\", StringComparison.Ordinal);
+            // 且每次 stat 都要过网络。强制回退到本机 LocalAppData。
+            // 只判断 \\server\share 不够：映射网络驱动器（Z:\）同样是 SMB，
+            // 必须按 DriveType 判定，否则断线时库会直接损坏
+            bool remoteExe = IsRemotePath(exeDir);
 
             // 1) exe 目录已有数据库：目录与库文件都可用才沿用（便携语义）。
             //    只看目录可写不够：库被设成只读时 sqlite 以读写方式打开一定失败，
             //    整个配置层会不可用且无法自愈
-            if (!uncExe && File.Exists(exeDb) && CanWrite(exeDir) && CanOpenDb(exeDb))
+            if (!remoteExe && File.Exists(exeDb) && CanWrite(exeDir) && CanOpenDb(exeDb))
             {
                 // 两个位置都有库时选较新的：曾因目录不可写回退到 LocalAppData，
                 // 目录恢复可写后若无条件用 exe 侧旧库，用户会看到配置「回到旧版本」。
@@ -237,7 +282,7 @@ namespace PCTools
                 return exeDir;
             }
             // 2) exe 侧有库但不可用：复制到 LocalAppData 后沿用
-            if (!uncExe && File.Exists(exeDb))
+            if (!remoteExe && File.Exists(exeDb))
             {
                 if (!sameDir)
                 {
@@ -253,7 +298,24 @@ namespace PCTools
                     }
                     catch (Exception ex) { DiagLog.Swallow("回退数据目录", ex); }
                 }
-                // 复制失败且目标不可用：宁可明确报「不可写」，也不要在 alt 新建空库
+                // 复制失败（跨用户 ACL、库被杀软锁死）：不再让整个配置层不可用。
+                // 本地目录可写时直接在 LocalAppData 新建一个空库，原库保持原样；
+                // 代价是这份配置与 exe 侧不共享，界面会明确提示一次
+                if (!sameDir)
+                {
+                    try
+                    {
+                        Directory.CreateDirectory(local);
+                        if (CanWrite(local))
+                        {
+                            SplitDatabase = true;
+                            Writability = true;
+                            return local;
+                        }
+                    }
+                    catch (Exception ex) { DiagLog.Swallow("新建回退配置库", ex); }
+                }
+                // 本地也不可写：明确报「不可写」，不要假装有配置
                 Writability = false;
                 return exeDir;
             }
@@ -264,7 +326,7 @@ namespace PCTools
                 return local;
             }
             // 4) 新装：能写就放 exe 同目录（保持便携），否则回落
-            if (!uncExe && CanWrite(exeDir)) { Writability = true; return exeDir; }
+            if (!remoteExe && CanWrite(exeDir)) { Writability = true; return exeDir; }
             try
             {
                 Directory.CreateDirectory(local);
@@ -274,9 +336,30 @@ namespace PCTools
             catch { Writability = false; return exeDir; }
         }
 
+        // 网络路径判定：UNC 与映射网络驱动器（Z:\）都要算。断线后 SQLite 的
+        // 每次读写都会失败，甚至留下半截事务，比「配置不共享」严重得多
+        private static bool IsRemotePath(string dir)
+        {
+            try
+            {
+                if (string.IsNullOrEmpty(dir)) return false;
+                if (dir.StartsWith(@"\\", StringComparison.Ordinal)) return true;
+                string root = Path.GetPathRoot(dir);
+                if (string.IsNullOrEmpty(root) || root.Length < 2) return false;
+                DriveInfo di = new DriveInfo(root);
+                return di.DriveType == DriveType.Network;
+            }
+            catch { return false; }
+        }
+
         // 数据目录在本次启动时是否可写。false 时界面要明确提示：否则用户只会看到
         // 「保存失败」或主题设置悄悄不生效
         internal static bool Writability;
+
+        // exe 侧的库存在但当前账户读不了（ACL 收窄 / 只读介质 / 被锁），
+        // 已在 LocalAppData 新建独立库。界面需要提示一次「本账户的配置是独立的」，
+        // 否则用户会以为之前的配置凭空消失
+        internal static bool SplitDatabase;
 
         // exe 所在目录（图标等随包资源仍写这里）
         internal static string ExeDir { get { return exeDir; } }
@@ -587,9 +670,13 @@ namespace PCTools
         // Migrate 仅保留给「同版本库被外部工具改坏、偶发缺列」的修复路径
         private const int SchemaVersion = 2;
 
-        // 本次启动是否因旧版本库而删库重建：界面需要明确告知一次，不能静默丢配置
+        // 本次启动是否因旧版本库而重建：界面需要明确告知一次，不能静默丢配置
         internal static bool Recreated;
         internal static string RecreatedFrom;
+        // 重建时旧库被改名保存到的路径（不再直接删除）：用户仍可回滚取证
+        internal static string RecreatedBackup;
+        // 无版本号的历史库被无损升级（结构与当前一致）：界面只需轻提示，不要求重新配置
+        internal static bool UpgradedFromLegacy;
         // 同版本补列检查每个进程只做一次，避免每次文件写入后都跑 19 次 PRAGMA
         private static bool repairChecked;
         // 任务基线曾在旧版本中记录运行态（就绪/正在运行/排队中），语义上都等于「已启用」。
@@ -654,11 +741,15 @@ namespace PCTools
                         ready = false;
                         return false;
                     }
-                    // 旧版本库（含没有版本号但有业务表的历史库）不再迁移：直接删除并新建。
-                    // ver==0 且没有任何业务表 = 全新空库，走正常建表
-                    if ((ver > 0 && ver < SchemaVersion) || (ver == 0 && HasUserTables(db)))
+                    // 旧版本库（含没有版本号但有业务表的历史库）不再迁移，直接备份后新建。
+                    // 例外：v1.0 建库时没有写 user_version，但五张业务表结构与当前完全一致，
+                    // 直接按最新 Schema 补齐（会自动新增 backup_state）并补写版本号，
+                    // 实现无损升级——以前把这种库当成「旧格式」删除，用户会永久丢掉
+                    // API Key 密文、历史建议与分析缓存
+                    bool legacyUnversioned = ver == 0 && HasUserTables(db);
+                    if (!legacyUnversioned && ver > 0 && ver < SchemaVersion)
                     {
-                        string old = ver > 0 ? "v" + ver : "无版本号";
+                        string old = "v" + ver;
                         Sqlite.Close(db);
                         db = IntPtr.Zero;
                         if (!ResetDatabaseFiles(old)) { ready = false; return false; }
@@ -669,10 +760,19 @@ namespace PCTools
 
                     string e = Sqlite.Exec(db, Schema);
                     if (e != null) { LastError = e; ready = false; return false; }
-                    if (ver < SchemaVersion)
+                    if (ver < SchemaVersion || legacyUnversioned)
                     {
-                        // 新建/重建的库：Schema 已是最新结构，只写版本号
+                        // 新建/重建/无损升级的库：Schema 已是最新结构，只写版本号
                         Sqlite.Exec(db, "PRAGMA user_version=" + SchemaVersion + ";");
+                        if (legacyUnversioned)
+                        {
+                            UpgradedFromLegacy = true;
+                            // 历史库可能被外部工具改坏过（偶发缺列）：一并不齐，
+                            // 之后不再重复跑
+                            Migrate(db);
+                            repairChecked = true;
+                            DiagLog.Note("无版本号的历史库已按最新结构补齐并写入版本号（无损升级）");
+                        }
                     }
                     else if (!repairChecked)
                     {
@@ -721,27 +821,53 @@ namespace PCTools
             return err == null && rows.Count > 0 && int.TryParse(rows[0], out n) && n > 0;
         }
 
-        // 删除旧版配置库及其伴生文件（-wal/-shm/-journal）。
-        // 删除后由调用方重新建库；失败时保留原文件并返回 false
+        // 旧版配置库改名备份后重建（-wal/-shm/-journal 一并改名）。
+        // 以前直接 File.Delete，用户升级后连取证/回滚的机会都没有；改名失败时
+        // 保留原文件并返回 false，绝不带着半套文件继续建库
         private static bool ResetDatabaseFiles(string oldVersion)
         {
+            string stamp = DateTime.Now.ToString("yyyyMMdd-HHmmss");
+            string mainBak = FilePath + ".bak-" + stamp;
+            string mainTarget = mainBak;
             try
             {
                 string[] suffixes = new string[] { "", "-wal", "-shm", "-journal" };
+                bool mainMoved = false;
                 foreach (string suffix in suffixes)
                 {
                     string p = FilePath + suffix;
-                    if (File.Exists(p)) File.Delete(p);
+                    if (!File.Exists(p)) continue;
+                    string target = (suffix.Length == 0 ? mainBak : mainBak + suffix);
+                    // 同一秒内连续两次重建（自检/脚本）会撞名：补一个序号，绝不覆盖已有备份
+                    if (File.Exists(target))
+                        target = target + "-" + Guid.NewGuid().ToString("N").Substring(0, 4);
+                    try
+                    {
+                        File.Move(p, target);
+                        if (suffix.Length == 0) { mainMoved = true; mainTarget = target; }
+                    }
+                    catch (Exception ex)
+                    {
+                        // 主库改名失败 = 整个备份失败；伴生文件失败只影响残留清理
+                        if (suffix.Length == 0) throw;
+                        DiagLog.Swallow("改名旧库伴生文件 " + suffix, ex);
+                    }
+                }
+                if (!mainMoved)
+                {
+                    LastError = "旧版配置库不存在或无法改名";
+                    return false;
                 }
                 Recreated = true;
                 RecreatedFrom = oldVersion;
-                DiagLog.Note("旧版配置库（" + oldVersion + "）已删除并按新版本重建");
+                RecreatedBackup = mainTarget;
+                DiagLog.Note("旧版配置库（" + oldVersion + "）已备份为 " + mainTarget + " 并按新版本重建");
                 return true;
             }
             catch (Exception ex)
             {
-                LastError = "旧版配置库无法删除：" + ex.Message;
-                DiagLog.Swallow("删除旧版配置库", ex);
+                LastError = "旧版配置库无法改名备份：" + ex.Message;
+                DiagLog.Swallow("备份旧版配置库", ex);
                 return false;
             }
         }
@@ -781,7 +907,10 @@ namespace PCTools
         }
 
         // 外部删表/换库后 ready 仍是 true，后续查询会全部失败且直到重启都不自愈。
-        // 用库文件的最后写入时间做廉价探活：每 30 秒最多 stat 一次，时间变了就重跑建表
+        // 用库文件的最后写入时间做廉价探活：每 30 秒最多 stat 一次，时间变了就重跑建表。
+        // 注意：本程序自己的写入也会改 mtime，所以这里的窗口不能太短——否则后台批量
+        // 写库期间每隔几秒就会跑一次 DDL 并撞上写锁。外部换库的即时恢复由
+        // IsSchemaError + ForceReensure 负责（见各读路径的重试）
         private static bool StampUnchanged()
         {
             if (DateTime.UtcNow < stampCheckedAt) return true;
@@ -800,6 +929,95 @@ namespace PCTools
             try { readyStamp = File.GetLastWriteTimeUtc(FilePath).Ticks; }
             catch { readyStamp = 0; }
             stampCheckedAt = DateTime.UtcNow.AddSeconds(30);
+        }
+
+        // 读路径拿到「no such table / file is not a database」时说明库已被外部替换，
+        // 而 ready 的 30 秒节流窗口还没到。这里立即作废 ready 并重跑一次 Ensure：
+        // 否则这一次读取会被当成「库里确实没有数据」，界面把整列建议/基线清空
+        internal static bool IsSchemaError(string error)
+        {
+            if (string.IsNullOrEmpty(error)) return false;
+            return error.IndexOf("no such table", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                   error.IndexOf("no such column", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                   error.IndexOf("file is not a database", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                   error.IndexOf("database disk image is malformed", StringComparison.OrdinalIgnoreCase) >= 0;
+        }
+
+        internal static void ForceReensure()
+        {
+            lock (gate)
+            {
+                ready = false;
+                repairChecked = false;
+                backupValuesChecked = false;
+                aclDone = false;
+            }
+            Ensure();
+        }
+
+        // 建议/分析表的孤儿清理：卸载程序、任务改名、包升级后旧键永久保留，
+        // 库与导出的 .pct 会无限增长。每个 kind 每天最多跑一次；只删「本次整页枚举
+        // 确实没有该键」且「超过 keepDays 天没更新」的行——临时读失败不会误删
+        private static readonly Dictionary<string, DateTime> prunedAt =
+            new Dictionary<string, DateTime>(StringComparer.Ordinal);
+        private static readonly object pruneGate = new object();
+
+        internal static void PruneCache(string kind, ICollection<string> liveKeys, int keepDays)
+        {
+            if (string.IsNullOrEmpty(kind) || liveKeys == null || liveKeys.Count == 0) return;
+            lock (pruneGate)
+            {
+                DateTime last;
+                if (prunedAt.TryGetValue(kind, out last) && (DateTime.UtcNow - last).TotalHours < 24)
+                    return;
+                prunedAt[kind] = DateTime.UtcNow;
+            }
+            try
+            {
+                if (!Ensure()) return;
+                string cutoff = DateTime.Now.AddDays(-Math.Max(1, keepDays)).ToString("yyyy-MM-dd HH:mm:ss");
+                IntPtr db = Sqlite.Open(FilePath, out LastError, 500);
+                if (db == IntPtr.Zero) return;
+                try
+                {
+                    ScopePrune(db, "advice", kind, liveKeys, cutoff);
+                    ScopePrune(db, "analysis", kind, liveKeys, cutoff);
+                }
+                finally { Sqlite.Close(db); }
+            }
+            catch (Exception ex) { DiagLog.Swallow("清理孤儿缓存 " + kind, ex); }
+        }
+
+        private static void ScopePrune(IntPtr db, string table, string kind, ICollection<string> live, string cutoff)
+        {
+            string err;
+            List<string[]> rows = Sqlite.Rows(db,
+                "SELECT item_key, IFNULL(updated,'') FROM " + table + " WHERE kind=" + Sqlite.Q(kind) + ";", out err);
+            if (err != null) return;
+            List<string> dead = new List<string>();
+            foreach (string[] r in rows)
+            {
+                if (r.Length < 2 || string.IsNullOrEmpty(r[0])) continue;
+                // 没有时间戳的行不参与清理：无法判断新旧，宁可留着
+                if (string.IsNullOrEmpty(r[1]) || string.CompareOrdinal(r[1], cutoff) >= 0) continue;
+                if (live.Contains(r[0])) continue;
+                dead.Add(r[0]);
+            }
+            for (int i = 0; i < dead.Count; i += 200)
+            {
+                int n = Math.Min(200, dead.Count - i);
+                StringBuilder sb = new StringBuilder();
+                sb.Append("DELETE FROM ").Append(table).Append(" WHERE kind=").Append(Sqlite.Q(kind))
+                  .Append(" AND item_key IN (");
+                for (int j = 0; j < n; j++)
+                {
+                    if (j > 0) sb.Append(',');
+                    sb.Append(Sqlite.Q(dead[i + j]));
+                }
+                sb.Append(");");
+                Sqlite.Exec(db, sb.ToString());
+            }
+            if (dead.Count > 0) DiagLog.Note("清理 " + table + "/" + kind + " 孤儿行 " + dead.Count + " 条");
         }
 
         // API Key 已由 DPAPI 按用户加密，这里再把文件 DACL 收窄到「当前用户 + SYSTEM + Administrators」，
@@ -906,7 +1124,22 @@ namespace PCTools
 
         internal static string FilePath { get { return AppDb.FilePath; } }
 
-        internal static string KeyStartup(StartupItem it) { return it.Name + "|" + it.Command; }
+        // 启动项键必须带作用域：以前是「名称|命令行」，同一程序同时注册当前用户与
+        // 所有用户启动项时（常见）两条会共用一份建议，一条的结论显示在另一条上。
+        // 直接复用备份键的 M/U + 审批路径 + 值名，两套口径不再各写一份
+        internal static string KeyStartup(StartupItem it)
+        {
+            if (it == null) return "";
+            string k = BackupStore.KeyFor(0, it);
+            return k == null ? "" : k;
+        }
+
+        // v1.0 的旧键：仅用于读取历史建议/分析，读到后由 FillStartup 迁移到新键
+        internal static string KeyStartupLegacy(StartupItem it)
+        {
+            return it == null ? "" : it.Name + "|" + it.Command;
+        }
+
         internal static string KeyService(ServiceItem it) { return it.ServiceName; }
         internal static string KeyTask(TaskItem it) { return it.FullPath; }
         internal static string KeyCtx(CtxMenuItem it) { return it.RegPath + "|" + it.Id; }
@@ -939,22 +1172,32 @@ namespace PCTools
             {
                 if (!File.Exists(FilePath)) { complete = true; return map; }   // 没有数据库 → 整列留空
                 if (!AppDb.Ensure()) return map;
-                string err;
-                IntPtr db = Sqlite.Open(FilePath, out err, 500);
-                if (db == IntPtr.Zero) return map;
-                try
+                string err = null;
+                // 外部删表/换库时首次查询会报 no such table：立即重建表结构并重试一次，
+                // 不能把这一次失败当成「库里确实没有」而清空界面
+                for (int attempt = 0; attempt < 2; attempt++)
                 {
-                    List<string[]> rows = Sqlite.Rows(db,
-                        "SELECT item_key, label FROM advice WHERE kind=" + Sqlite.Q(kind) + ";", out err);
-                    if (err != null) return map;
-                    foreach (string[] row in rows)
+                    IntPtr db = Sqlite.Open(FilePath, out err, 500);
+                    if (db == IntPtr.Zero) return map;
+                    try
                     {
-                        string key = row.Length > 0 ? row[0] : "";
-                        if (key.Length > 0) map[key] = row.Length > 1 ? row[1] : "";
+                        List<string[]> rows = Sqlite.Rows(db,
+                            "SELECT item_key, label FROM advice WHERE kind=" + Sqlite.Q(kind) + ";", out err);
+                        if (err == null)
+                        {
+                            foreach (string[] row in rows)
+                            {
+                                string key = row.Length > 0 ? row[0] : "";
+                                if (key.Length > 0) map[key] = row.Length > 1 ? row[1] : "";
+                            }
+                            complete = true;
+                            return map;
+                        }
                     }
-                    complete = true;
+                    finally { Sqlite.Close(db); }
+                    if (attempt > 0 || !AppDb.IsSchemaError(err)) return map;
+                    AppDb.ForceReensure();
                 }
-                finally { Sqlite.Close(db); }
             }
             catch { }
             return map;
@@ -1022,7 +1265,96 @@ namespace PCTools
             bool complete;
             Dictionary<string, string> map = Load(KindStartup, out complete);
             if (!complete) return;                 // 读失败：保留界面现状，不清空
-            foreach (StartupItem it in list) Set(it, map, KeyStartup(it));
+            // 旧键（名称|命令行）只读兜底：读到后把建议与分析一并搬到新键，
+            // 用户升级后不需要为整页启动项重新分析、重复付费
+            List<string[]> migrate = null;
+            foreach (StartupItem it in list)
+            {
+                string key = KeyStartup(it);
+                string v;
+                if ((key.Length == 0 || !map.TryGetValue(key, out v)) &&
+                    map.TryGetValue(KeyStartupLegacy(it), out v) && AdviceAllowed(0, v))
+                {
+                    it.AiAdvice = v;
+                    it.AiAdviceRank = RankOf(v);
+                    string old = KeyStartupLegacy(it);
+                    if (key.Length > 0 && old.Length > 0 && old != key)
+                    {
+                        if (migrate == null) migrate = new List<string[]>();
+                        migrate.Add(new string[] { old, key });
+                    }
+                    continue;
+                }
+                Set(it, map, key);
+            }
+            if (migrate != null) MigrateKeys(KindStartup, migrate);
+            PruneLive(KindStartup, list);
+        }
+
+        // 键结构升级用：把旧键的 advice / analysis 行整体搬到新键（同一事务）。
+        // 新键已有行时以旧行为准（旧行才是用户实际看到过的结论）
+        private static readonly HashSet<string> keysMigrated = new HashSet<string>(StringComparer.Ordinal);
+        private static void MigrateKeys(string kind, List<string[]> pairs)
+        {
+            if (pairs == null || pairs.Count == 0) return;
+            lock (keysMigrated)
+            {
+                if (!keysMigrated.Add(kind)) return;
+            }
+            try
+            {
+                if (!AppDb.Ensure()) return;
+                string openErr;
+                IntPtr db = Sqlite.Open(FilePath, out openErr, 1500);
+                if (db == IntPtr.Zero) return;
+                try
+                {
+                    StringBuilder sb = new StringBuilder("BEGIN;");
+                    foreach (string[] p in pairs)
+                    {
+                        string oldKey = Sqlite.Q(p[0]);
+                        string newKey = Sqlite.Q(p[1]);
+                        string k = Sqlite.Q(kind);
+                        sb.Append("INSERT OR REPLACE INTO advice (kind,item_key,label,updated) ")
+                          .Append("SELECT kind,").Append(newKey).Append(",label,updated FROM advice WHERE kind=")
+                          .Append(k).Append(" AND item_key=").Append(oldKey).Append(';')
+                          .Append("DELETE FROM advice WHERE kind=").Append(k)
+                          .Append(" AND item_key=").Append(oldKey).Append(';')
+                          .Append("DELETE FROM analysis WHERE kind=").Append(k)
+                          .Append(" AND item_key=").Append(newKey).Append(';')
+                          .Append("INSERT OR REPLACE INTO analysis (kind,item_key,seq,model,intro,advice,updated,in_tokens,out_tokens) ")
+                          .Append("SELECT kind,").Append(newKey)
+                          .Append(",seq,model,intro,advice,updated,in_tokens,out_tokens FROM analysis WHERE kind=")
+                          .Append(k).Append(" AND item_key=").Append(oldKey).Append(';')
+                          .Append("DELETE FROM analysis WHERE kind=").Append(k)
+                          .Append(" AND item_key=").Append(oldKey).Append(';');
+                    }
+                    sb.Append("COMMIT;");
+                    string e = Sqlite.Exec(db, sb.ToString());
+                    if (e != null) { Sqlite.Exec(db, "ROLLBACK;"); DiagLog.Note("启动项键迁移失败：" + e); }
+                    else DiagLog.Note("启动项 AI 键已迁移 " + pairs.Count + " 项");
+                }
+                finally { Sqlite.Close(db); }
+            }
+            catch (Exception ex) { DiagLog.Swallow("迁移启动项 AI 键", ex); }
+        }
+
+        // 整页枚举完成后清理孤儿行：只清 advice/analysis，不动用户显式保存的备份基线
+        private static void PruneLive(string kind, IEnumerable<object> items)
+        {
+            try
+            {
+                HashSet<string> live = new HashSet<string>(StringComparer.Ordinal);
+                foreach (object o in items)
+                {
+                    IAiAdviceItem it = o as IAiAdviceItem;
+                    if (it == null) continue;
+                    string k = AiAnalysisStore.KeyFor(PageOf(it), o);
+                    if (!string.IsNullOrEmpty(k)) live.Add(k);
+                }
+                if (live.Count > 0) AppDb.PruneCache(kind, live, 180);
+            }
+            catch (Exception ex) { DiagLog.Swallow("收集缓存清理键 " + kind, ex); }
         }
 
         internal static void FillServices(List<ServiceItem> list)
@@ -1032,6 +1364,7 @@ namespace PCTools
             Dictionary<string, string> map = Load(KindService, out complete);
             if (!complete) return;
             foreach (ServiceItem it in list) Set(it, map, KeyService(it));
+            PruneLive(KindService, list);
         }
 
         internal static void FillTasks(List<TaskItem> list)
@@ -1041,6 +1374,7 @@ namespace PCTools
             Dictionary<string, string> map = Load(KindTask, out complete);
             if (!complete) return;
             foreach (TaskItem it in list) Set(it, map, KeyTask(it));
+            PruneLive(KindTask, list);
         }
 
         internal static void FillCtx(List<CtxMenuItem> list)
@@ -1049,7 +1383,28 @@ namespace PCTools
             bool complete;
             Dictionary<string, string> map = Load(KindCtx, out complete);
             if (!complete) return;
-            foreach (CtxMenuItem it in list) Set(it, map, KeyCtx(it));
+            List<string[]> migrate = null;
+            foreach (CtxMenuItem it in list)
+            {
+                string key = KeyCtx(it);
+                string v;
+                bool hit = key.Length > 0 && map.TryGetValue(key, out v);
+                if (!hit && !string.IsNullOrEmpty(it.KeyLegacy) &&
+                    map.TryGetValue(it.KeyLegacy, out v) && AdviceAllowed(3, v))
+                {
+                    it.AiAdvice = v;
+                    it.AiAdviceRank = RankOf(v);
+                    if (key.Length > 0)
+                    {
+                        if (migrate == null) migrate = new List<string[]>();
+                        migrate.Add(new string[] { it.KeyLegacy, key });
+                    }
+                    continue;
+                }
+                Set(it, map, key);
+            }
+            if (migrate != null) MigrateKeys(KindCtx, migrate);
+            PruneLive(KindCtx, list);
         }
 
         // 只覆盖本次有结论的项：补全分析跳过的旧项、以及请求失败但库里仍有旧结论的项，
@@ -1150,26 +1505,36 @@ namespace PCTools
             try
             {
                 if (!AppDb.Ensure()) { error = AppDb.LastError; return set; }
-                // 由 UI 线程直接调用（「更新AI分析」前统计缺口）：短超时避免卡住界面
-                IntPtr db = Sqlite.Open(FilePath, out error, 500);
-                if (db == IntPtr.Zero) return set;
-                try
+                // 由 UI 线程直接调用（「更新AI分析」前统计缺口）：短超时避免卡住界面。
+                // 外部换库导致的 no such table 立即重建并重试一次，否则会把整页都算成缺失
+                for (int attempt = 0; attempt < 2; attempt++)
                 {
-                    // 走主键 (kind,item_key,seq) 的前缀，不需要额外索引。
-                    // 只算「确实有建议正文」的行：模型偶尔只回介绍、advice 为空，
-                    // 这种行若算已完成，「补全分析」就永远不会再覆盖它
-                    List<string> rows = Sqlite.Column(db,
-                        "SELECT item_key FROM analysis WHERE kind=" + Sqlite.Q(kind) +
-                        " AND IFNULL(advice,'') <> '' GROUP BY item_key;", out error);
-                    foreach (string r in rows) set.Add(r);
-                    lock (keySetGate)
+                    IntPtr db = Sqlite.Open(FilePath, out error, 500);
+                    if (db == IntPtr.Zero) return set;
+                    try
                     {
-                        if (keySetStamp != stamp) { keySetCache.Clear(); keySetStamp = stamp; }
-                        keySetCache[kind] = new HashSet<string>(set, StringComparer.Ordinal);
-                        keySetAt = DateTime.UtcNow;
+                        // 走主键 (kind,item_key,seq) 的前缀，不需要额外索引。
+                        // 只算「确实有建议正文」的行：模型偶尔只回介绍、advice 为空，
+                        // 这种行若算已完成，「补全分析」就永远不会再覆盖它
+                        List<string> rows = Sqlite.Column(db,
+                            "SELECT item_key FROM analysis WHERE kind=" + Sqlite.Q(kind) +
+                            " AND IFNULL(advice,'') <> '' GROUP BY item_key;", out error);
+                        if (error == null)
+                        {
+                            foreach (string r in rows) set.Add(r);
+                            lock (keySetGate)
+                            {
+                                if (keySetStamp != stamp) { keySetCache.Clear(); keySetStamp = stamp; }
+                                keySetCache[kind] = new HashSet<string>(set, StringComparer.Ordinal);
+                                keySetAt = DateTime.UtcNow;
+                            }
+                            return set;
+                        }
                     }
+                    finally { Sqlite.Close(db); }
+                    if (attempt > 0 || !AppDb.IsSchemaError(error)) return set;
+                    AppDb.ForceReensure();
                 }
-                finally { Sqlite.Close(db); }
             }
             catch (Exception ex) { error = ex.Message; }
             return set;
@@ -1223,33 +1588,43 @@ namespace PCTools
                 // 表结构由 AppDb.Ensure 统一建：读取路径不再发 DDL，
                 // 否则每次打开分析窗都要抢一次写锁，和后台写入互相阻塞
                 if (!AppDb.Ensure()) { error = AppDb.LastError; return list; }
-                string err;
-                // 打开结果窗时会直接调用：短超时，库被占用时尽快给出「读失败」而不是挂住界面
-                IntPtr db = Sqlite.Open(FilePath, out err, 500);
-                if (db == IntPtr.Zero) { error = err; return list; }
-                try
+                string err = null;
+                // 打开结果窗时会直接调用：短超时，库被占用时尽快给出「读失败」而不是挂住界面。
+                // no such table（外部换库）重试一次，避免把历史结论误判为「没有缓存」
+                for (int attempt = 0; attempt < 2; attempt++)
                 {
-                    string sql = "SELECT IFNULL(model,''), IFNULL(updated,''), IFNULL(in_tokens,0), " +
-                                 "IFNULL(out_tokens,0), IFNULL(intro,''), IFNULL(advice,'') " +
-                                 "FROM analysis WHERE kind=" + Sqlite.Q(kind) +
-                                 " AND item_key=" + Sqlite.Q(key) + " ORDER BY seq ASC;";
-                    List<string[]> rows = Sqlite.Rows(db, sql, out err);
-                    if (err != null) { error = err; return list; }
-                    foreach (string[] p in rows)
+                    IntPtr db = Sqlite.Open(FilePath, out err, 500);
+                    if (db == IntPtr.Zero) { error = err; return list; }
+                    try
                     {
-                        if (p.Length < 6) continue;
-                        Entry en = new Entry();
-                        en.Model = p[0];
-                        en.Updated = p[1];
-                        int n;
-                        if (int.TryParse(p[2], out n)) en.InTokens = n;
-                        if (int.TryParse(p[3], out n)) en.OutTokens = n;
-                        en.Intro = p[4];
-                        en.Advice = p[5];
-                        list.Add(en);
+                        string sql = "SELECT IFNULL(model,''), IFNULL(updated,''), IFNULL(in_tokens,0), " +
+                                     "IFNULL(out_tokens,0), IFNULL(intro,''), IFNULL(advice,'') " +
+                                     "FROM analysis WHERE kind=" + Sqlite.Q(kind) +
+                                     " AND item_key=" + Sqlite.Q(key) + " ORDER BY seq ASC;";
+                        List<string[]> rows = Sqlite.Rows(db, sql, out err);
+                        if (err == null)
+                        {
+                            foreach (string[] p in rows)
+                            {
+                                if (p.Length < 6) continue;
+                                Entry en = new Entry();
+                                en.Model = p[0];
+                                en.Updated = p[1];
+                                int n;
+                                if (int.TryParse(p[2], out n)) en.InTokens = n;
+                                if (int.TryParse(p[3], out n)) en.OutTokens = n;
+                                en.Intro = p[4];
+                                en.Advice = p[5];
+                                list.Add(en);
+                            }
+                            return list;
+                        }
                     }
+                    finally { Sqlite.Close(db); }
+                    error = err;
+                    if (attempt > 0 || !AppDb.IsSchemaError(err)) return list;
+                    AppDb.ForceReensure();
                 }
-                finally { Sqlite.Close(db); }
             }
             catch (Exception ex) { error = ex.Message; }
             return list;
@@ -1526,6 +1901,38 @@ namespace PCTools
                 try
                 {
                     Sqlite.Exec(db, "DELETE FROM usage WHERE config_index=" + index + ";");
+                }
+                finally { Sqlite.Close(db); }
+            }
+            catch { }
+        }
+
+        // 一次开库清多套：配置保存时逐套调用 Clear 会各开一次库（每次最长 500ms），
+        // 在 UI 线程上叠加起来就是肉眼可见的卡顿
+        internal static void ClearMany(IEnumerable<int> indexes)
+        {
+            if (indexes == null) return;
+            List<int> ids = new List<int>();
+            foreach (int i in indexes)
+                if (i > 0 && !ids.Contains(i)) ids.Add(i);
+            if (ids.Count == 0) return;
+            lock (cacheGate) { _cache = null; }
+            try
+            {
+                if (!AppDb.Ensure()) return;
+                string err;
+                IntPtr db = Sqlite.Open(AiAdviceStore.FilePath, out err, 500);
+                if (db == IntPtr.Zero) return;
+                try
+                {
+                    StringBuilder sb = new StringBuilder("DELETE FROM usage WHERE config_index IN (");
+                    for (int i = 0; i < ids.Count; i++)
+                    {
+                        if (i > 0) sb.Append(',');
+                        sb.Append(ids[i]);
+                    }
+                    sb.Append(");");
+                    Sqlite.Exec(db, sb.ToString());
                 }
                 finally { Sqlite.Close(db); }
             }

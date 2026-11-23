@@ -46,11 +46,35 @@ namespace PCTools
         private bool finished;
         private bool completed;      // 已跑完但窗口保留，等用户点「关闭」
         private bool forceClose;     // 主窗口退出时强制放行
+        private bool safePoint;      // 允许「当前数据集完成后停止」，不触发 3 秒强制关窗
         private DispatcherTimer cancelWatch;   // 取消后若 worker 迟迟不返回，强制关窗释放模态锁
+        private DispatcherTimer clock;         // 已用时长：无超时兜底的长任务至少让用户看到进展
+        private readonly DateTime startedAt = DateTime.Now;
+        private string stepText = "";
+        private volatile bool workerDone;      // worker 真正跑完（含收尾写库），才允许释放忙碌标记
         internal Action OnCancel;    // 取消回调：让调用方中止在途请求
         internal Action OnCompleted; // 跑完但仍留窗时调用：主窗先复位忙碌状态，不必等用户关窗
 
         internal bool Cancelled { get { return cancelled; } }
+
+        // 窗口可能被强制关闭，但 worker 仍在写库：调用方据此决定是否收尾/复位忙碌状态
+        internal bool WorkerDone { get { return workerDone; } }
+
+        internal void MarkWorkerDone() { workerDone = true; }
+
+        // 导入/导出这类逐数据集提交的任务：不提供「立刻中止」（会留下半套数据），
+        // 但允许「当前数据集完成后停止」。以前连这个入口都没有，库被长时间占用时
+        // 用户只能结束进程，反而更容易留下写了一半的数据
+        internal void EnableSafePointCancel()
+        {
+            if (cancelBtn == null) return;
+            safePoint = true;
+            cancelBtn.Visibility = Visibility.Visible;
+            cancelBtn.Content = "完成当前后停止";
+            cancelBtn.Click -= OnCancelClick;
+            cancelBtn.Click += OnCancelClick;
+            if (hint != null) hint.Text = "「停止」会在当前数据集完成后生效，已写入的部分保留";
+        }
 
 #if DIAG
         internal bool CancelVisibleForTest
@@ -97,12 +121,40 @@ namespace PCTools
             detail.Text = "0 / " + total + " · 准备中…";
 
             if (allowCancel) cancelBtn.Click += OnCancelClick;
-            else cancelBtn.Visibility = Visibility.Collapsed;
+            else
+            {
+                cancelBtn.Visibility = Visibility.Collapsed;
+                // XAML 的默认提示是「可以随时取消」，对导入/导出这类不可取消任务是错误引导
+                if (hint != null) hint.Text = "此操作不能中途取消，请等待完成（下方显示已用时长）";
+            }
+
+            // 已用时长：不可取消的任务以前连「卡了多久」都看不到，只能结束进程
+            clock = new DispatcherTimer();
+            clock.Interval = TimeSpan.FromSeconds(1);
+            clock.Tick += delegate { UpdateClock(); };
+            Loaded += delegate { UpdateClock(); clock.Start(); };
+            Closed += delegate { if (clock != null) clock.Stop(); };
+        }
+
+        private void UpdateClock()
+        {
+            if (hint == null || finished) return;
+            int sec = (int)Math.Max(0, (DateTime.Now - startedAt).TotalSeconds);
+            string tip = allowCancel ? "可随时点右下角「取消」，已完成的项目会保留"
+                                     : "此操作不能中途取消，请等待完成";
+            string step = string.IsNullOrEmpty(stepText) ? "" : " · " + stepText;
+            hint.Text = tip + " · 已用 " + sec + " 秒" + step;
         }
 
         private void OnCancelClick(object sender, RoutedEventArgs e) { RequestCancel(); }
 
         private void OnCloseClick(object sender, RoutedEventArgs e) { Close(); }
+
+        // 收尾时停掉「已用时长」计时器：保留窗口显示结果时秒表不该继续走
+        private void StopClock()
+        {
+            if (clock != null) clock.Stop();
+        }
 
         internal void RequestCancel()
         {
@@ -115,7 +167,10 @@ namespace PCTools
                 cancelBtn.IsEnabled = false;
                 cancelBtn.Content = "正在停止…";
             }
-            if (detail != null) detail.Text = "正在停止，等待当前项目完成…";
+            if (detail != null) detail.Text = safePoint
+                ? "正在停止，等当前数据集提交完成后中止…"
+                : "正在停止，等待当前项目完成…";
+            if (safePoint) return;      // 不能 3 秒后强制关窗：写库中途关窗会留下半套数据
             // worker 可能卡在 WMI/SCM 调用里（WMI 已设 20 秒上限，SCM 的 15 秒等待也在
             // 单次操作内），但它毕竟是后台线程：不能让模态窗无限期挡住主界面。
             // 3 秒内没结束就强制关窗，worker 在后台自行收尾（Abort 已由 OnCancel 触发）
@@ -149,6 +204,7 @@ namespace PCTools
             detail.Text = string.IsNullOrEmpty(name)
                 ? "已完成 " + done + " / " + total
                 : "已完成 " + done + " / " + total + " · " + name;
+            stepText = string.IsNullOrEmpty(name) ? "" : name;
             if (tokens == null) return;
             if (hasUsage)
             {
@@ -163,6 +219,7 @@ namespace PCTools
         internal void Finish()
         {
             finished = true;
+            StopClock();
             if (cancelWatch != null) cancelWatch.Stop();
             Close();
         }
@@ -173,6 +230,7 @@ namespace PCTools
             if (finished) return;
             completed = true;
             finished = true;                 // 让 OnClosing 放行，窗口才能真正关掉
+            StopClock();
             if (bar != null) bar.Value = bar.Maximum;
             if (head != null) head.Text = "「" + verb + "」已完成";
             if (detail != null) detail.Text = summary;
@@ -195,6 +253,7 @@ namespace PCTools
         internal void ForceClose()
         {
             if (cancelWatch != null) cancelWatch.Stop();
+            StopClock();
             forceClose = true;
             finished = true;
             try { Close(); }
@@ -206,8 +265,9 @@ namespace PCTools
             if (!finished && !forceClose)
             {
                 e.Cancel = true;
-                // 不可取消的任务：把 X / Alt+F4 也一并忽略，避免窗口先关、worker 还在写库
-                if (!allowCancel) return;
+                // 不可取消的任务：把 X / Alt+F4 也一并忽略，避免窗口先关、worker 还在写库。
+                // 安全点取消（导入/导出）允许把 X 转成「完成当前后停止」
+                if (!allowCancel && !safePoint) return;
                 RequestCancel();
                 return;
             }
@@ -624,6 +684,12 @@ namespace PCTools
                 // 否则同一个 Esc 会同时触发 IsCancel 与 KeyDown 两次 Close()
                 yes.IsCancel = true;
             }
+            else
+            {
+                // 两/三按钮形态：Esc 必须等于「取消」。以前没有设置 IsCancel，
+                // Esc 既不关窗也不取消，与系统习惯相反
+                no.IsCancel = true;
+            }
             no.Click += delegate { Choice = ConfirmChoice.Cancel; Close(); };
             yes.Click += delegate { Choice = ConfirmChoice.Primary; Close(); };
             third.Click += delegate { Choice = ConfirmChoice.Third; Close(); };
@@ -731,6 +797,7 @@ namespace PCTools
         private TextBlock meta;
         private TextBlock usage;
         private Button btnRefresh;
+        private Button btnClose;
         private StackPanel oldPane;
         private StackPanel newPane;
         private TextBox adviceOld;
@@ -754,6 +821,11 @@ namespace PCTools
         private readonly List<AiAnalysisStore.Entry> entries = new List<AiAnalysisStore.Entry>();
         private bool busy;
         private bool hadContent;
+        private DispatcherTimer reqClock;       // 已用时长：让用户知道还要等多久、可以取消
+        private DateTime reqStart;
+        private string reqBase = "";
+        // 单条分析的总时长上限（含重试与退避）：最坏 120s×3 + 退避 ≈ 6 分钟，这里收到 150 秒
+        private const int RequestBudgetMs = 150000;
 
         // 模型按【介绍】/【建议】两段返回；拿不到标记时整体作为介绍，避免丢内容
         internal static void Split(string text, out string intro, out string advice)
@@ -857,6 +929,23 @@ namespace PCTools
             overlay.Visibility = Visibility.Collapsed;
         }
 
+        // 主题切换后重取状态色：标签色是构造时从 Palette 取的静态画刷，不重取就会
+        // 在深色主题下保留浅色主题的深色文字（看起来像「没变色」）
+        private void OnPaletteChanged()
+        {
+            RecolorTag(adviceTag);
+            RecolorTag(tagOld);
+            if (overlay != null) overlay.Background = DialogShell.SolidTheme("DialogBg");
+        }
+
+        private static void RecolorTag(TextBlock tb)
+        {
+            if (tb == null || string.IsNullOrEmpty(tb.Text)) return;
+            if (tb.Text == "禁用") tb.Foreground = Palette.Red;
+            else if (tb.Text == "手动") tb.Foreground = Palette.Blue;
+            else tb.Foreground = Palette.Green;
+        }
+
 #if DIAG
         // 自检入口：不读不写缓存，每次都直接请求
         internal AiResultWindow(string subject, string prompt, AiConfig cfg,
@@ -906,8 +995,21 @@ namespace PCTools
             ((TextBlock)view.FindName("AiSubject")).Text = subject;
             ((TextBlock)view.FindName("AdviceHeading")).Text =
                 string.IsNullOrEmpty(adviceHeading) ? "处理建议" : adviceHeading;
+            // 单条分析的总时长预算：单次 120 秒 + 两次重试与退避最坏能拖到 6 分钟，
+            // 模态窗会把人锁在里面。超过预算不再发起新的重试，并明确报「超时」
+            btnClose = (Button)view.FindName("BtnAiClose");
             ((Button)view.FindName("BtnAiClose")).Click += delegate { Close(); };
             btnRefresh.Click += delegate { StartRequest(); };
+            reqClock = new DispatcherTimer();
+            reqClock.Interval = TimeSpan.FromSeconds(1);
+            reqClock.Tick += delegate
+            {
+                if (!busy) return;
+                int sec = (int)Math.Max(0, (DateTime.Now - reqStart).TotalSeconds);
+                string tail = " · 已用 " + sec + " 秒（上限约 " + (RequestBudgetMs / 1000) + " 秒，可点右下角「取消」中止）";
+                if (hadContent) meta.Text = reqBase + tail;
+                else if (overlayText != null) overlayText.Text = reqBase + "\n" + tail.TrimStart(' ', '·');
+            };
 
             // 转圈动画用计时器驱动，避免在运行时解析的 XAML 里挂 Storyboard
             spinTransform = new RotateTransform(0, 13, 13);
@@ -916,6 +1018,7 @@ namespace PCTools
             spinTimer.Interval = TimeSpan.FromMilliseconds(16);
             spinTimer.Tick += delegate { spinTransform.Angle = (spinTransform.Angle + 9) % 360; };
             HideOverlay();          // 默认不盖住内容：只有首次请求或出错时才显示浮层
+            Palette.Changed += OnPaletteChanged;
 
             meta.Text = string.IsNullOrEmpty(cfg.Model)
                 ? (string.IsNullOrEmpty(cfg.Endpoint) ? "尚未配置 AI 接口" : cfg.Endpoint)
@@ -930,8 +1033,10 @@ namespace PCTools
             {
                 closed = true;
                 if (spinTimer != null) spinTimer.Stop();
+                if (reqClock != null) reqClock.Stop();
                 HttpWebRequest r = inflight;
                 if (r != null) { try { r.Abort(); } catch { } }
+                Palette.Changed -= OnPaletteChanged;
             };
 
             // 窗口加载后再按真实显示器收紧宽度：构造阶段还没有 HWND，
@@ -1001,8 +1106,13 @@ namespace PCTools
             btnRefresh.IsEnabled = false;
             btnRefresh.Content = "正在更新…";
             usage.Text = "";
+            // 忙碌期间「关闭」就是「取消」：关窗会中止在途请求，不会继续烧 Token
+            if (btnClose != null) { btnClose.Content = "取消"; btnClose.ToolTip = "中止这次分析请求"; }
+            reqStart = DateTime.Now;
+            reqBase = "正在请求 " + cfg.Model + (adviceOnly ? "（仅更新建议）" : "") + " …";
+            if (reqClock != null) reqClock.Start();
             // 有旧内容时不遮罩，避免对比内容闪烁
-            if (hadContent) meta.Text = "正在请求 " + cfg.Model + (adviceOnly ? "（仅更新建议）" : "") + " …";
+            if (hadContent) meta.Text = reqBase;
             else ShowOverlay(true, "正在获取 AI 数据…");
 
             string kind = AiAnalysisStore.KindFor(page);
@@ -1025,7 +1135,7 @@ namespace PCTools
                     {
                         inflight = r;
                         if (closed) { try { r.Abort(); } catch { } }
-                    }, 120000);
+                    }, 120000, RequestBudgetMs);
 
                     if (reply.Parsed)
                     {
@@ -1086,6 +1196,8 @@ namespace PCTools
                     {
                         inflight = null;
                         busy = false;
+                        if (reqClock != null) reqClock.Stop();
+                        if (btnClose != null) { btnClose.Content = "关闭"; btnClose.ToolTip = null; }
                         btnRefresh.IsEnabled = true;
                         btnRefresh.Content = "更新AI分析";
                         if (closed) return;

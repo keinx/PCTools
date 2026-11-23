@@ -677,7 +677,8 @@ namespace PCTools
                 catch (Exception ex) { AddWarn(warn, "启动文件夹 " + f.Dir + "：" + ex.Message); }
             }
             AiAdviceStore.FillStartup(list);
-            BackupStore.FillStartup(list);
+            if (!BackupStore.FillStartup(list))
+                AddWarn(warn, "读取备份基线失败：本次「备份状态」列可能显示为未备份，请勿据此重新备份（稍后刷新可恢复）");
             return list;
         }
 
@@ -821,7 +822,8 @@ namespace PCTools
             }
             catch (Exception ex) { AddWarn(warn, "服务读取失败：" + ex.Message); }
             AiAdviceStore.FillServices(list);
-            BackupStore.FillServices(list);
+            if (!BackupStore.FillServices(list))
+                AddWarn(warn, "读取备份基线失败：本次「备份启动类型」列可能显示为未备份，请勿据此重新备份");
             return list;
         }
 
@@ -912,7 +914,8 @@ namespace PCTools
                 ReleaseCom(svc);
             }
             AiAdviceStore.FillTasks(list);
-            BackupStore.FillTasks(list);
+            if (!BackupStore.FillTasks(list))
+                AddWarn(warn, "读取备份基线失败：本次「备份状态」列可能显示为未备份，请勿据此重新备份");
             return list;
         }
 
@@ -1194,7 +1197,8 @@ namespace PCTools
             try { AddPackagedMenus(list, warn); }
             catch (Exception ex) { AddWarn(warn, "打包扩展：" + ex.Message); }
             AiAdviceStore.FillCtx(list);
-            BackupStore.FillCtx(list);
+            if (!BackupStore.FillCtx(list))
+                AddWarn(warn, "读取备份基线失败：本次「备份状态」列可能显示为未备份，请勿据此重新备份");
             return list;
         }
 
@@ -1291,6 +1295,20 @@ namespace PCTools
             catch { return null; }
         }
 
+        // 包族名（Name_PublisherHash）：注册表里的包键是「全名」，含版本/架构/资源 ID，
+        // 任何一次应用升级都会让它变化。以前直接拿全名拼 RegPath，升级后该菜单项的
+        // 备份基线、AI 建议与分析缓存全部失配，看起来像「新出现一项」
+        private static string PackageFamily(string pkg)
+        {
+            if (string.IsNullOrEmpty(pkg)) return "";
+            string[] p = pkg.Split('_');
+            // 全名 = 名称_版本_架构_资源ID_发布者哈希；名称本身可能含下划线，
+            // 所以名称部分要把最后四段全部去掉再拼回来
+            if (p.Length >= 5 && p[p.Length - 1].Length > 0)
+                return string.Join("_", p, 0, p.Length - 4) + "_" + p[p.Length - 1];
+            return pkg;
+        }
+
         private static void AddOnePackagedMenu(List<CtxMenuItem> list, List<string> warn, RegistryKey packages,
                                                string root, string pkg, string appsDir)
         {
@@ -1372,7 +1390,9 @@ namespace PCTools
                 it.Id = "{" + id + "}";
                 it.Handler = dll;
                 it.RelPath = "";
-                it.RegPath = "打包：" + pkg;
+                it.RegPath = "打包：" + PackageFamily(pkg);
+                // 旧键：包全名含版本，升级后会变；只用于读取历史备份/建议
+                it.KeyLegacy = "打包：" + pkg + "|" + it.Id;
                 bool blockedUser = CtxReg.IsExtBlocked(false, it.Id);
                 bool blockedMachine = CtxReg.IsExtBlocked(true, it.Id);
                 it.Status = (blockedUser || blockedMachine) ? "已禁用" : "已启用";
@@ -1396,16 +1416,17 @@ namespace PCTools
             }
         }
 
-        // 告警统一入口：以前各处的上限不一致（8 / 60 / 无上限），
-        // 服务项逐条失败时能把 warn 撑到几百条，界面只显示条数，等于白占内存
-        private const int WarnMax = 60;
+        // 告警统一入口。以前到 60 条就把第 60 条替换成「其余已省略」，界面按 warn.Count
+        // 显示「60 项读取告警」——实际可能是 300 项，排障时完全看不出少了什么。
+        // 现在保留全部（单条限长 + 去重），展示层再截断：条数始终是真实值
+        private const int WarnMaxText = 300;
         private static void AddWarn(List<string> warn, string msg)
         {
             if (warn == null || string.IsNullOrEmpty(msg)) return;
-            if (warn.Count < WarnMax) { warn.Add(msg); return; }
-            // 截断提示占用最后一条，而不是额外 append：界面按 warn.Count 显示「N 项读取告警」，
-            // 多加一条会让这个数字比真实告警数多 1
-            warn[WarnMax - 1] = "…（告警过多，其余已省略）";
+            if (msg.Length > WarnMaxText) msg = msg.Substring(0, WarnMaxText) + "…";
+            // 同一类失败（例如某个文件夹下所有任务都读不了）重复几十条没有信息量
+            if (warn.Contains(msg)) return;
+            warn.Add(msg);
         }
 
         // ---------------- 统一着色：枚举阶段与 RepaintItems 共用，避免两处规则漂移 ----------------

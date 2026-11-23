@@ -137,7 +137,7 @@ namespace PCTools
             return one;
         }
 
-        private void MirrorFirst()
+        internal void MirrorFirst()
         {
             Skipped = 0;
             foreach (PctSet s in Sets) Skipped += s.Skipped;
@@ -500,13 +500,26 @@ namespace PCTools
             return true;
         }
 
-        // XML 1.0 不允许的控制字符会让 XAttribute 构造直接抛异常，写入前先剔除
-        private static string Clean(string s)
+        // XML 1.0 不允许的控制字符会让 XAttribute 构造直接抛异常，写入前先剔除。
+        // 同时丢弃孤立代理项：库里的非法 UTF-16 会让 XmlWriter 的 CheckCharacters
+        // 直接抛异常，整次导出失败（以前只判断单字节，代理对会被原样带出去）
+        internal static string Clean(string s)
         {
             if (string.IsNullOrEmpty(s)) return "";
             StringBuilder sb = new StringBuilder(s.Length);
-            foreach (char c in s)
+            for (int i = 0; i < s.Length; i++)
             {
+                char c = s[i];
+                if (char.IsHighSurrogate(c))
+                {
+                    if (i + 1 < s.Length && char.IsLowSurrogate(s[i + 1]))
+                    {
+                        sb.Append(c).Append(s[i + 1]);
+                        i++;
+                    }
+                    continue;                   // 孤立高代理项：丢弃
+                }
+                if (char.IsLowSurrogate(c)) continue;
                 if (c == '\t' || c == '\n' || c == '\r' || (c >= 0x20 && c != 0xFFFE && c != 0xFFFF))
                     sb.Append(c);
             }
@@ -578,8 +591,14 @@ namespace PCTools
 
         internal static string Limit(string s, int max)
         {
-            if (string.IsNullOrEmpty(s)) return "";
-            return s.Length <= max ? s : s.Substring(0, max);
+            if (string.IsNullOrEmpty(s) || max <= 0) return "";
+            // 先剔除 XML 非法字符与孤立代理项：截断后再清洗可能把代理对切成半个，
+            // 写进库后导出时 XmlWriter 会直接抛异常
+            s = PctPackage.Clean(s);
+            if (s.Length <= max) return s;
+            int cut = max;
+            if (cut > 0 && char.IsHighSurrogate(s[cut - 1])) cut--;   // 不切断代理对
+            return cut <= 0 ? "" : s.Substring(0, cut);
         }
 
         internal static string KindFor(int project)
@@ -735,10 +754,19 @@ namespace PCTools
             return BuildSets(targets, names, null, out pkg, out empty, out error);
         }
 
-        // progress：每处理完一个组合回调一次（空集也算），用于驱动导出进度窗
+        // progress：每处理完一个组合回调一次（空集也算），用于驱动导出进度窗。
+        // cancelled：安全点取消（返回 true 时不再开始下一个数据集，已读出的部分不写文件）
         internal static bool BuildSets(IList<DatasetRef> targets,
                                        Func<int, Dictionary<string, string>> names,
                                        Action<int, int, string> progress,
+                                       out PctPackage pkg, out List<string> empty, out string error)
+        {
+            return BuildSets(targets, names, progress, null, out pkg, out empty, out error);
+        }
+
+        internal static bool BuildSets(IList<DatasetRef> targets,
+                                       Func<int, Dictionary<string, string>> names,
+                                       Action<int, int, string> progress, Func<bool> cancelled,
                                        out PctPackage pkg, out List<string> empty, out string error)
         {
             pkg = new PctPackage();
@@ -757,6 +785,12 @@ namespace PCTools
             int done = 0;
             foreach (DatasetRef t in targets)
             {
+                // 安全点：只在两个数据集之间检查，绝不打断正在读/正在提交的那一个
+                if (cancelled != null && cancelled())
+                {
+                    error = "已取消：未写入文件";
+                    return false;
+                }
                 done++;
                 bool valid = t != null && t.Project >= 0 && t.Project <= 3 && t.Type >= 0 && t.Type <= 2;
                 string label = valid ? ProjectName(t.Project) + " / " + TypeName(t.Project, t.Type) : "无效数据集";
@@ -798,11 +832,9 @@ namespace PCTools
                 return false;
             }
 
-            // 兼容字段同步第一集：旧接口仍能读到一个有效数据集
-            pkg.Project = pkg.Sets[0].Project;
-            pkg.Type = pkg.Sets[0].Type;
-            pkg.Rows = pkg.Sets[0].Rows;
-            foreach (PctSet s in pkg.Sets) pkg.Skipped += s.Skipped;
+            // 兼容字段同步第一集：旧接口仍能读到一个有效数据集。
+            // 统一走 MirrorFirst，避免这里与读取路径各写一遍、新增数据集类型时漏改
+            pkg.MirrorFirst();
             return true;
         }
 
@@ -831,17 +863,25 @@ namespace PCTools
         // 多数据集导入：逐集执行、逐集报告；0 行集直接拒绝，绝不触发整表替换
         internal static void ImportSets(IList<PctSet> sets, out List<SetImportResult> results)
         {
-            ImportSets(sets, null, out results);
+            ImportSets(sets, null, null, out results);
         }
 
         internal static void ImportSets(IList<PctSet> sets, Action<int, int, string> progress,
                                         out List<SetImportResult> results)
+        {
+            ImportSets(sets, progress, null, out results);
+        }
+
+        internal static void ImportSets(IList<PctSet> sets, Action<int, int, string> progress,
+                                        Func<bool> cancelled, out List<SetImportResult> results)
         {
             results = new List<SetImportResult>();
             if (sets == null) return;
             int total = sets.Count;
             for (int i = 0; i < sets.Count; i++)
             {
+                // 安全点取消：当前数据集已完整提交，停在这里不会留下半套数据
+                if (cancelled != null && cancelled()) break;
                 PctSet s = sets[i];
                 SetImportResult r = new SetImportResult();
                 r.Set = s;
@@ -1133,6 +1173,7 @@ namespace PCTools
         private List<TransferSetItem> importItems;
         private bool busy;
         private bool disposed;
+        private bool lastStatusError;      // 主题切换后按原语义重取状态色
 
         internal event Action<int[]> Imported;
 
@@ -1207,6 +1248,13 @@ namespace PCTools
             repick.Click += delegate { PickImportFile(); };
             run.Click += delegate { Run(); };
             Unloaded += delegate { disposed = true; };
+            // 状态文字用的是 Palette 静态画刷：换主题后必须重取，否则深色主题下
+            // 这一行仍是浅色主题的深灰/深红，几乎看不见
+            Palette.Changed += delegate
+            {
+                if (status == null) return;
+                status.Foreground = lastStatusError ? Palette.Red : Palette.Gray;
+            };
 
             UpdateMode();
             RefreshCounts();
@@ -1373,6 +1421,7 @@ namespace PCTools
         private void SetStatus(string text, bool error)
         {
             if (status == null) return;
+            lastStatusError = error;
             status.Text = text;
             status.Foreground = error ? Palette.Red : Palette.Gray;
             status.Visibility = string.IsNullOrEmpty(text) ? Visibility.Collapsed : Visibility.Visible;
@@ -1471,6 +1520,7 @@ namespace PCTools
             string failure = null;
 
             ProgressWindow pw = new ProgressWindow("导出", steps, false);
+            pw.EnableSafePointCancel();      // 允许「完成当前数据集后停止」，不留下写到一半的文件
             pw.Owner = owner;
             Thread th = new Thread(delegate()
             {
@@ -1484,6 +1534,7 @@ namespace PCTools
                         {
                             Post(pw, delegate { pw.Report(done, all, label); });
                         },
+                        delegate { return pw.Cancelled; },
                         out pkg, out empty, out err);
                     if (good)
                     {
@@ -1515,6 +1566,13 @@ namespace PCTools
 
             SetBusy(false);
             if (disposed) return;
+            if (pw.Cancelled && failure != null &&
+                failure.StartsWith("已取消", StringComparison.Ordinal))
+            {
+                // 安全点取消：还没写文件，明确告知「什么都没改」而不是弹「导出失败」
+                SetStatus("已取消导出，未写入文件", false);
+                return;
+            }
             if (failure != null || built == null || built.Sets.Count == 0)
             {
                 string why = failure == null ? "没有可写入的数据集" : failure;
@@ -1696,6 +1754,7 @@ namespace PCTools
             List<SetImportResult> results = null;
             string crash = null;
             ProgressWindow pw = new ProgressWindow("导入", chosen.Count, false);
+            pw.EnableSafePointCancel();      // 只在两个数据集之间停，避免整表替换写到一半
             pw.Owner = Window.GetWindow(this);
             Thread work = new Thread(delegate()
             {
@@ -1707,6 +1766,7 @@ namespace PCTools
                         {
                             Post(pw, delegate { pw.Report(done, all, label); });
                         },
+                        delegate { return pw.Cancelled; },
                         out r);
                     results = r;
                 }
@@ -1765,6 +1825,8 @@ namespace PCTools
             }
 
             StringBuilder detail = new StringBuilder();
+            if (pw.Cancelled)
+                detail.AppendLine("已按「停止」在当前数据集完成后中止；下面只统计已提交的部分。").AppendLine();
             detail.Append("已导入 ").Append(okCount).Append(" 个数据集，共 ")
                   .Append(written).Append(" 条");
             if (skipped > 0) detail.Append("（跳过 ").Append(skipped).Append(" 条）");
@@ -1809,8 +1871,9 @@ namespace PCTools
             RefreshCounts();
             UpdateImportSummary();
 
-            string title = failLines.Count == 0 ? "导入完成"
-                         : (okCount == 0 ? "导入失败" : "导入未完全成功");
+            string title = pw.Cancelled ? "导入已中止（已完成部分保留）"
+                         : (failLines.Count == 0 ? "导入完成"
+                         : (okCount == 0 ? "导入失败" : "导入未完全成功"));
             Dialogs.Info(Window.GetWindow(this), title, detail.ToString());
 
             if (pages.Count > 0)

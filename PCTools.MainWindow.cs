@@ -52,6 +52,9 @@ namespace PCTools
         private TextBlock listSummary;            // 列表上方的条数与分布统计
         private Button btnAnalyzeAll;             // 逐项 AI 分析
         private bool aiBusy;                     // AI 批量任务进行中，防重入
+        // 每次 AI 任务递增的令牌：摘要窗可能在「新任务已启动」之后才关闭，
+        // 收尾时只有令牌仍是当前值才允许释放 aiBusy，否则会误放新任务的锁
+        private int aiTaskSeq;
         private ProgressWindow aiProgress;       // 当前非模态 AI 进度窗
         private bool quitting;                   // 主窗口已进入关闭流程
         private Button btnAdmin;
@@ -273,8 +276,7 @@ namespace PCTools
                         });
                     };
                 }
-                // 旧版库被删除重建：必须明确告知一次，否则用户只会发现
-                // 「AI 配置不见了、历史建议全空」，却不知道是本程序按新版本要求清掉的
+                // 旧版库被改名备份后重建：明确告知备份位置，用户仍可回滚取证
                 if (AppDb.Recreated)
                 {
                     Loaded += delegate
@@ -284,9 +286,41 @@ namespace PCTools
                             if (quitting || closed) return;
                             Dialogs.Info(this, "配置库已重建",
                                 "检测到旧版配置库（" + (AppDb.RecreatedFrom ?? "旧格式") +
-                                "），已按当前版本要求删除并新建。\n\n" +
-                                "AI 接口配置、历史建议与分析缓存需要重新录入或生成。\n" +
-                                "库文件：" + AppDb.FilePath);
+                                "），已按当前版本要求重建。\n\n" +
+                                "原库已备份为：\n" + (AppDb.RecreatedBackup ?? "(未知)") + "\n\n" +
+                                "AI 接口配置、历史建议与分析缓存需要重新录入或生成；" +
+                                "如需回滚，请关闭本程序后用上面的备份文件覆盖\n" + AppDb.FilePath);
+                        });
+                    };
+                }
+                // 无版本号的历史库（v1.0）已无损升级：只需要轻提示，不必重新配置
+                if (AppDb.UpgradedFromLegacy)
+                {
+                    Loaded += delegate
+                    {
+                        Dispatcher.BeginInvoke((Action)delegate
+                        {
+                            if (quitting || closed) return;
+                            Dialogs.Info(this, "配置库已无损升级",
+                                "检测到 v1.0 的配置库（没有版本号，结构与当前一致），" +
+                                "已直接补齐表结构并写入版本号。\n\n" +
+                                "AI 接口配置、历史建议与分析缓存均已保留，无需重新录入。");
+                        });
+                    };
+                }
+                // 本账户无法读取 exe 同目录的库，已在 LocalAppData 新建独立库
+                if (AppPaths.SplitDatabase)
+                {
+                    Loaded += delegate
+                    {
+                        Dispatcher.BeginInvoke((Action)delegate
+                        {
+                            if (quitting || closed) return;
+                            Dialogs.Info(this, "已启用独立配置库",
+                                "无法读取程序目录下的配置库（权限不足、被杀软锁定或文件只读），" +
+                                "已在当前用户目录新建一份独立配置：\n" + AppDb.FilePath + "\n\n" +
+                                "本账户的 AI 配置与历史结果保存在这份新库里；" +
+                                "原库未被修改，换回有权限的账户仍可继续使用。");
                         });
                     };
                 }
@@ -557,7 +591,7 @@ namespace PCTools
 
         private void MenuAction(int page, string op)
         {
-            if (op == "refresh") { RefreshPage(page); return; }
+            if (op == "refresh") { RefreshPageForced(page); return; }
             if (op == "copy") { CopySelection(page); return; }
             // 列表正在后台重读：此刻执行操作作用在旧数据上，刷新结束后结果还会被新数据覆盖，
             // 排队机制能救回刷新却救不回操作语义，直接拦下最稳妥
@@ -653,13 +687,28 @@ namespace PCTools
             return ok;
         }
 
-        // 端点指纹：只存 8 位哈希，避免把可能带查询参数的完整地址写进设置表
+        // 端点指纹：只存 16 位哈希，避免把可能带查询参数的完整地址写进设置表。
+        // 以前用 32 位 FNV：理论上可构造碰撞，让新端点复用旧端点的「已同意」记录、
+        // 跳过一次性隐私提示。换成 SHA-256 前 8 字节（64 位），碰撞成本足够高
         private static string EndpointTag(string url)
         {
             string s = (url == null ? "" : url.Trim().ToLowerInvariant());
-            uint h = 2166136261u;
-            for (int i = 0; i < s.Length; i++) { h ^= s[i]; h *= 16777619u; }
-            return h.ToString("x8");
+            try
+            {
+                using (SHA256 sha = SHA256.Create())
+                {
+                    byte[] h = sha.ComputeHash(Encoding.UTF8.GetBytes(s));
+                    StringBuilder sb = new StringBuilder(16);
+                    for (int i = 0; i < 8; i++) sb.Append(h[i].ToString("x2"));
+                    return sb.ToString();
+                }
+            }
+            catch
+            {
+                // 理论上不可用（SHA256 是内置实现）：退化为长度 + 首尾字符，仍比固定值安全
+                if (s.Length == 0) return "0";
+                return s.Length.ToString("x") + ((int)s[0]).ToString("x");
+            }
         }
 
         private void AiAnalyze(int page)
@@ -910,6 +959,7 @@ namespace PCTools
             Dictionary<string, string> known = new Dictionary<string, string>();
 
             aiBusy = true;
+            int taskId = ++aiTaskSeq;
             if (trigger != null) trigger.IsEnabled = false;
             // 构造/显示进度窗失败时必须复位 aiBusy，否则本次运行内所有 AI 功能
             // 都会被 4997/5165 的守卫拒绝，只能重启进程
@@ -929,23 +979,26 @@ namespace PCTools
             pw.Closed += delegate
             {
                 if (aiProgress == pw) aiProgress = null;
+                // worker 还没真正结束（取消后 3 秒强制关窗）：此时只解除模态，不释放
+                // aiBusy、不弹收尾提示。旧 worker 可能仍卡在 HTTP 里，随后继续写
+                // advice/usage；让它与第二个任务并发只会互相覆盖甚至 database is locked
+                if (!pw.WorkerDone)
+                {
+                    SetStatus("进度窗口已关闭，后台仍在收尾；完成后会自动回填结果");
+                    return;
+                }
                 // 窗口关闭时直接弹模态框会踩「Owner 已关闭」，延后一轮消息循环再收尾。
                 // 走 Ui()：应用退出、Dispatcher 停摆时静默放弃，不抛未处理异常
                 Ui((Action)delegate
                 {
                     FinishAdviceBatch(page, trigger, total, skippedTotal, ok, saved, error, warning,
-                                      failed, cfg, known);
+                                      failed, cfg, known, taskId);
                 });
             };
-            // 批量完成后进度窗会保留显示摘要；此时就复位 aiBusy 并回填标签，
-            // 否则用户把窗口留在一边时所有 AI 入口都会提示「已有任务」
-            pw.OnCompleted = delegate
-            {
-                aiBusy = false;
-                if (trigger != null) trigger.IsEnabled = true;
-                ApplyAdviceLabels(page, known);
-                UpdateToolbarState();
-            };
+            // 批量完成后进度窗会保留显示摘要；忙碌标记不在这里释放：
+            // 窗口被强制关闭时也会触发本回调，提前释放会让第二个 AI 任务与仍在写库的
+            // 旧 worker 并发执行。释放统一放到 worker 的 finally（见下）
+            pw.OnCompleted = null;
 
             Thread worker = new Thread(delegate()
             {
@@ -1168,6 +1221,9 @@ namespace PCTools
                 }
                 finally
                 {
+                    // worker 的所有写库动作都已结束：从这一刻起才允许释放忙碌标记。
+                    // 必须在投递 Finish 之前置位，否则强制关窗时 Closed 回调会读到 false
+                    pw.MarkWorkerDone();
                     bool cFinal = cancelled;
                     bool uFinal = hasUsage;
                     int inFinal = inTok;
@@ -1176,6 +1232,16 @@ namespace PCTools
                     int savedFinal = saved;
                     string errFinal = error;
                     string warnFinal = warning;
+                    // 收尾回填与状态复位：走 Ui 保证在界面线程执行；即使进度窗已被
+                    // 强制关闭，结果仍会回填到列表，aiBusy 也会被真正释放
+                    Dictionary<string, string> knownFinal = known;
+                    Ui((Action)delegate
+                    {
+                        ReleaseAi(taskId);
+                        if (trigger != null) trigger.IsEnabled = true;
+                        if (!quitting && !closed) ApplyAdviceLabels(page, knownFinal);
+                        UpdateToolbarState();
+                    });
                     Ui((Action)delegate
                     {
                         if (okFinal)
@@ -1262,14 +1328,20 @@ namespace PCTools
             ApplyFilter();
         }
 
+        // 只有仍是「当前任务」时才释放忙碌标记：摘要窗可能在新任务启动后才关闭
+        private void ReleaseAi(int taskId)
+        {
+            if (taskId == aiTaskSeq) aiBusy = false;
+        }
+
         // 「更新 AI 建议」进度窗关闭后的收尾
         private void FinishAdviceBatch(int page, Button trigger, int total, int skipped,
                                        bool ok, int saved, string error, string warning,
                                        List<AiFailedItem> failed, AiConfig cfg,
-                                       Dictionary<string, string> labels)
+                                       Dictionary<string, string> labels, int taskId)
         {
             if (quitting || closed) return;
-            aiBusy = false;
+            ReleaseAi(taskId);
             if (trigger != null) trigger.IsEnabled = true;
             ApplyAdviceLabels(page, labels);
             ApplyFilter();
@@ -1469,6 +1541,7 @@ namespace PCTools
         {
             if (items == null || items.Count == 0) return;
             aiBusy = true;
+            int taskId = ++aiTaskSeq;
             // 与「更新AI建议」一致：进度窗非模态期间按钮先置灰，
             // 收尾时 aiBusy=false 后由 UpdateListSummary 按列表内容恢复
             if (trigger != null) trigger.IsEnabled = false;
@@ -1502,18 +1575,20 @@ namespace PCTools
             pw.Closed += delegate
             {
                 if (aiProgress == pw) aiProgress = null;
+                // worker 未真正结束时（取消后强制关窗）不释放忙碌标记、不弹收尾提示：
+                // 它可能仍卡在 HTTP 调用里，随后继续写 analysis/usage
+                if (!pw.WorkerDone)
+                {
+                    SetStatus("进度窗口已关闭，后台仍在收尾；完成后会自动回填结果");
+                    return;
+                }
                 // 窗口关闭时直接弹模态框会踩「Owner 已关闭」，延后一轮消息循环再收尾。
                 // 走 Ui()：应用退出、Dispatcher 停摆时静默放弃
-                Ui((Action)delegate { FinishAnalysisBatch(page, outcome, labels); });
+                Ui((Action)delegate { FinishAnalysisBatch(page, outcome, labels, taskId); });
             };
-            // 跑完即复位忙碌状态：摘要窗保留期间不应继续拦住其它 AI 入口
-            pw.OnCompleted = delegate
-            {
-                if (outcome.AdviceError == null) ApplyAdviceLabels(page, labels);
-                aiBusy = false;
-                if (trigger != null) trigger.IsEnabled = true;
-                UpdateToolbarState();
-            };
+            // 忙碌标记改由 worker 的 finally 释放（见下）：OnCompleted 在强制关窗时
+            // 也会被触发，正是「旧 worker 还在写库、新任务已经启动」的来源
+            pw.OnCompleted = null;
 
             Thread worker = new Thread(delegate()
             {
@@ -1621,6 +1696,18 @@ namespace PCTools
                     bool usageFinal = hasUsage;
                     int inFinal = inTok;
                     int outFinal = outTok;
+                    // 所有缓存/用量/建议写库都已结束：先置「worker 已完成」，
+                    // 再投递摘要与状态复位。强制关窗时 Closed 回调据此跳过收尾，
+                    // 由这里统一释放 aiBusy，不会再出现两个 worker 并发写库
+                    pw.MarkWorkerDone();
+                    Ui((Action)delegate
+                    {
+                        ReleaseAi(taskId);
+                        if (trigger != null) trigger.IsEnabled = true;
+                        if (!quitting && !closed && outcome.AdviceError == null)
+                            ApplyAdviceLabels(page, labels);
+                        UpdateToolbarState();
+                    });
                     Ui((Action)delegate
                     {
                         string summary = string.IsNullOrEmpty(scope) ? "" : scope + "\n";
@@ -1683,12 +1770,12 @@ namespace PCTools
         }
 
         // 进度窗关闭后的收尾：复位状态、回填「AI建议」列、报告失败项
-        private void FinishAnalysisBatch(int page, BatchOutcome o, Dictionary<string, string> labels)
+        private void FinishAnalysisBatch(int page, BatchOutcome o, Dictionary<string, string> labels, int taskId)
         {
             if (o == null) return;
             if (quitting || closed) return;    // 主窗口正在退出：不刷列表、不弹窗
 
-            aiBusy = false;
+            ReleaseAi(taskId);
             // 回填「AI建议」列：只重画本地数据，不重新枚举系统
             if (o.AdviceError == null) ApplyAdviceLabels(page, labels);
             // 内部会按 aiBusy 重算「更新AI分析」按钮的可用性
@@ -1881,7 +1968,23 @@ namespace PCTools
 
         private void WireRefresh(string name, int page)
         {
-            Find<Button>(name).Click += delegate { RefreshPage(page); };
+            // 用户显式点刷新：即使上次已被看门狗放弃，也给一个带确认的强制重试入口。
+            // 以前 loadAbandoned 会永久拦住刷新，WMI 一次假死就只能重启程序
+            Find<Button>(name).Click += delegate { RefreshPageForced(page); };
+        }
+
+        private void RefreshPageForced(int page)
+        {
+            if (loadAbandoned)
+            {
+                if (!Dialogs.Confirm(this,
+                    "上次读取在 45 秒内没有返回（WMI 或任务计划服务无响应），后台可能仍有线程卡住。\n\n" +
+                    "强制再启动一次读取可能让卡住的线程与 RCW 继续堆积；若只是偶发卡顿，重试通常可以恢复。\n\n" +
+                    "确定要继续吗？",
+                    "强制重新读取")) return;
+                loadAbandoned = false;
+            }
+            LoadAsync(page);
         }
 
 #if DIAG
@@ -2442,6 +2545,8 @@ namespace PCTools
             string suffix = "";
             if (!AppPaths.Writability)
                 suffix += " · 配置目录不可写（" + AppPaths.Dir + "），设置与 AI 结果无法保存";
+            else if (AppPaths.SplitDatabase)
+                suffix += " · 正在使用当前用户的独立配置库（" + AppPaths.Dir + "）";
             if (!AppDb.Usable)
             {
                 string why = AppDb.LastError == null ? "" : AppDb.LastError.Trim();
@@ -2882,8 +2987,12 @@ namespace PCTools
         {
             if (warnings.Count == 0) return;
             StringBuilder sb = new StringBuilder();
-            foreach (string w in warnings) sb.AppendLine("· " + w);
-            Dialogs.Info(this, "读取告警", sb.ToString());
+            // 明细可能上百条：只渲染前 200 条，条数仍是真实值（不再被 60 条上限吃掉）
+            int shown = Math.Min(200, warnings.Count);
+            for (int i = 0; i < shown; i++) sb.AppendLine("· " + warnings[i]);
+            if (warnings.Count > shown)
+                sb.AppendLine("…（其余 " + (warnings.Count - shown) + " 条未显示，可设置 PCTOOLS_LOG=1 后复查）");
+            Dialogs.Info(this, "读取告警（共 " + warnings.Count + " 项）", sb.ToString());
         }
 
         // 后台线程向 UI 投递动作的统一入口。应用退出时 Dispatcher 一旦停摆，

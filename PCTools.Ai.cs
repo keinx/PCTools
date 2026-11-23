@@ -236,6 +236,13 @@ namespace PCTools
         // 整表重写：一次事务里清空 ai_config 再逐套写入，顺便清掉已删配置的累计用量
         internal static bool SaveAll(List<AiConfig> list, int active)
         {
+            return SaveAll(list, active, 3000);
+        }
+
+        // busyMs：保存通常由 UI 线程发起。后台批量分析正在写库时，3 秒的等待会把
+        // 界面明显卡住；配置页传更短的超时，宁可这次保存失败并提示原因
+        internal static bool SaveAll(List<AiConfig> list, int active, int busyMs)
+        {
             if (list == null) list = new List<AiConfig>();
             // 整表重写前先挡住非法输入：编号越界或重复会被 INSERT OR REPLACE 静默合并，
             // 写出 11 号行后 LoadAll 又会把它过滤掉，下一次保存就永久丢失该套配置
@@ -265,7 +272,7 @@ namespace PCTools
             }
             if (!AppDb.Ensure()) { Note(list, AppDb.LastError); return false; }
             string err;
-            IntPtr db = Sqlite.Open(AppDb.FilePath, out err);
+            IntPtr db = Sqlite.Open(AppDb.FilePath, out err, busyMs);
             if (db == IntPtr.Zero) { Note(list, err); return false; }
             try
             {
@@ -569,10 +576,21 @@ namespace PCTools
         internal static AiReply AskReply(AiConfig cfg, string userPrompt, string systemPrompt,
                                          Action<HttpWebRequest> onRequest, int timeoutMs)
         {
+            return AskReply(cfg, userPrompt, systemPrompt, onRequest, timeoutMs, 0);
+        }
+
+        // totalBudgetMs > 0 时给「单次请求 + 重试 + 退避」一个总预算：到点立刻抛错，
+        // 不再发起新一轮 120 秒等待。单条分析窗口是模态的，没有总预算时最坏锁住用户 6 分钟
+        internal static AiReply AskReply(AiConfig cfg, string userPrompt, string systemPrompt,
+                                         Action<HttpWebRequest> onRequest, int timeoutMs, int totalBudgetMs)
+        {
             if (string.IsNullOrEmpty(systemPrompt)) systemPrompt = SystemPrompt;
             string bad = ValidateEndpoint(cfg.Endpoint, !string.IsNullOrEmpty(cfg.ApiKey));
             if (bad != null) throw new Exception(bad);
 
+            DateTime deadline = totalBudgetMs > 0
+                ? DateTime.UtcNow.AddMilliseconds(totalBudgetMs)
+                : DateTime.MaxValue;
             bool includeMaxTokens = true;
             bool maxTokensRetried = false;
             int retries = 0;
@@ -580,10 +598,27 @@ namespace PCTools
             // 429 / 5xx / 连接类失败最多重试两次：批量分析一次限流就丢一项，用户只能整批重跑
             while (true)
             {
-                if (retries > 0) Thread.Sleep(retries == 1 ? 1200 : 3000);
+                if (DateTime.UtcNow >= deadline)
+                {
+                    string why = last == null ? "" : "；最后一次错误：" + last.Message;
+                    throw new Exception("请求超出总时长上限（" + (totalBudgetMs / 1000) + " 秒），已停止重试" + why);
+                }
+                if (retries > 0)
+                {
+                    int backoff = retries == 1 ? 1200 : 3000;
+                    double left = (deadline - DateTime.UtcNow).TotalMilliseconds;
+                    if (totalBudgetMs > 0 && left <= backoff) Thread.Sleep((int)Math.Max(0, left));
+                    else Thread.Sleep(backoff);
+                }
                 try
                 {
-                    return SendOnce(cfg, userPrompt, systemPrompt, onRequest, timeoutMs, includeMaxTokens);
+                    int thisTimeout = timeoutMs;
+                    if (totalBudgetMs > 0)
+                    {
+                        double left = (deadline - DateTime.UtcNow).TotalMilliseconds;
+                        thisTimeout = (int)Math.Max(5000, Math.Min(timeoutMs, left));
+                    }
+                    return SendOnce(cfg, userPrompt, systemPrompt, onRequest, thisTimeout, includeMaxTokens);
                 }
                 catch (AiHttpException ex)
                 {
@@ -1144,7 +1179,10 @@ namespace PCTools
                 plan.Sent++;
                 plan.Keys[plan.Sent] = key;
                 plan.Items[plan.Sent] = items[i];
-                body.AppendLine(plan.Sent + "|" + name + "|" + id + "|" + extra);
+                // 行格式是「序号|名称|标识|补充信息」：名称/命令行里的半角竖线会把字段
+                // 挤错位，模型可能把后半段当成标识，甚至回显出一行「看起来像序号」的
+                // 文本被 Parse 当成另一项的结果。发送前统一换成全角竖线
+                body.AppendLine(plan.Sent + "|" + Field(name) + "|" + Field(id) + "|" + Field(extra));
             }
 
             StringBuilder sb = new StringBuilder();
@@ -1152,6 +1190,14 @@ namespace PCTools
             sb.AppendLine("列表类型：" + typeName + "（共 " + plan.Sent + " 项）");
             sb.Append(body);
             return sb.ToString();
+        }
+
+        // 提示词字段清洗：分隔符替换 + 去换行/制表符，空值用 "-" 占位
+        private static string Field(string s)
+        {
+            if (string.IsNullOrEmpty(s)) return "-";
+            s = s.Replace("|", "｜").Replace("\r", " ").Replace("\n", " ").Replace("\t", " ").Trim();
+            return s.Length == 0 ? "-" : s;
         }
 
         // 补充信息压缩：展开环境变量 → 去引号与命令行参数 → 目录缩写 → 限长

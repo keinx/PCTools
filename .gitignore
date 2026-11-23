@@ -3,6 +3,10 @@ PCToolsAI.sqlite-wal
 PCToolsAI.sqlite-shm
 PCToolsAI.sqlite-journal
 PCToolsAI.sqlite.tmp
+*.sqlite.bak-*
+
+# 单实例数据目录锁（运行时生成）
+.pctools.lock
 
 *.sqlite-journal
 *.sqlite-wal

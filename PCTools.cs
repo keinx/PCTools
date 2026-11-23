@@ -37,8 +37,8 @@ using Microsoft.Win32;
 [assembly: AssemblyTitle("PCTools")]
 [assembly: AssemblyDescription("Windows 启动项 / 服务 / 计划任务 / 右键菜单管理工具")]
 [assembly: AssemblyProduct("PCTools")]
-[assembly: AssemblyVersion("1.1.0.0")]
-[assembly: AssemblyFileVersion("1.1.0.0")]
+[assembly: AssemblyVersion("1.1.1.0")]
+[assembly: AssemblyFileVersion("1.1.1.0")]
 
 namespace PCTools
 {
@@ -156,6 +156,9 @@ namespace PCTools
         public string Handler { get; set; }     // 处理程序 DLL 路径，可为空
         public string RegPath { get; set; }     // HKEY_CLASSES_ROOT\… 完整路径
         public string RelPath { get; set; }     // 相对 Software\Classes 的路径，写 LegacyDisable 用
+        // 旧版键（打包扩展曾用「全名含版本」拼键）：仅用于读取历史备份/AI 建议，
+        // 应用升级换了包版本后仍能把旧结论认回来
+        public string KeyLegacy { get; set; }
         public string Detail { get; set; }
         public string Search { get; set; }
         public int Tab { get; set; }            // 与 CtxRoot.Tab 一致：0 全局 / 1 桌面 / 2 驱动器 / 3 文件 / 4 文件夹 / 5 文件和文件夹
@@ -232,7 +235,7 @@ namespace PCTools
         private static string ReadVersion()
         {
             try { return typeof(AppInfo).Assembly.GetName().Version.ToString(3); }
-            catch { return "1.1.0"; }
+            catch { return "1.1.1"; }
         }
     }
 
@@ -251,6 +254,10 @@ namespace PCTools
         internal static Brush OrangeBg;
 
         static Palette() { Refresh(true); }
+
+        // 主题切换通知：弹窗/配置页里的状态文字直接持有 Palette 的静态画刷引用，
+        // 换主题后这些局部文字不会跟着变。订阅方在 Refresh 之后重新取一次画刷即可
+        internal static event Action Changed;
 
         // 状态色随主题切换：浅色用深字浅底，深色用亮字深底
         internal static void Refresh(bool light)
@@ -272,6 +279,12 @@ namespace PCTools
                 Blue = Make("#63C8FF"); BlueBg = Make("#13293B");
                 Orange = Make("#E8B15C"); OrangeBg = Make("#332817");
                 Neutral = Make("#B6BDC7");
+            }
+            Action h = Changed;
+            if (h != null)
+            {
+                try { h(); }
+                catch { }     // 单个订阅方失败不能影响主题本身生效
             }
         }
 

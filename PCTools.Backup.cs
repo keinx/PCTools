@@ -116,6 +116,9 @@ namespace PCTools
             bool done;
             List<BackupRow> rows = LoadRows(kind, out err, out done);
             complete = done;
+            // 读失败不再是「静默当空」：至少留一条诊断，否则界面显示全「未备份」时
+            // 无法区分「确实没备份」与「库被占用/结构异常」
+            if (!done) DiagLog.Note("读取备份基线失败 " + kind + "：" + (err ?? "未知原因"));
             foreach (BackupRow r in rows) map[r.Key] = r.Value;
             return map;
         }
@@ -129,28 +132,37 @@ namespace PCTools
             try
             {
                 if (!AppDb.Ensure()) { error = AppDb.LastError; return rows; }
-                // 由后台枚举线程调用：短超时，避免和 AI 批量写库抢锁时长期阻塞
-                IntPtr db = Sqlite.Open(AppDb.FilePath, out error, 500);
-                if (db == IntPtr.Zero) return rows;
-                try
+                // 由后台枚举线程调用：短超时，避免和 AI 批量写库抢锁时长期阻塞。
+                // 外部换库导致的 no such table 立即重建并重试一次，否则整页都会误报「未备份」
+                for (int attempt = 0; attempt < 2; attempt++)
                 {
-                    List<string[]> data = Sqlite.Rows(db,
-                        "SELECT item_key, IFNULL(name,''), IFNULL(value,''), IFNULL(updated,'') " +
-                        "FROM backup_state WHERE kind=" + Sqlite.Q(kind) + " ORDER BY item_key;", out error);
-                    if (error != null) return rows;
-                    foreach (string[] p in data)
+                    IntPtr db = Sqlite.Open(AppDb.FilePath, out error, 500);
+                    if (db == IntPtr.Zero) return rows;
+                    try
                     {
-                        if (p.Length < 4 || string.IsNullOrEmpty(p[0])) continue;
-                        BackupRow r = new BackupRow();
-                        r.Key = p[0];
-                        r.Name = p[1];
-                        r.Value = p[2];
-                        r.Updated = p[3];
-                        rows.Add(r);
+                        List<string[]> data = Sqlite.Rows(db,
+                            "SELECT item_key, IFNULL(name,''), IFNULL(value,''), IFNULL(updated,'') " +
+                            "FROM backup_state WHERE kind=" + Sqlite.Q(kind) + " ORDER BY item_key;", out error);
+                        if (error == null)
+                        {
+                            foreach (string[] p in data)
+                            {
+                                if (p.Length < 4 || string.IsNullOrEmpty(p[0])) continue;
+                                BackupRow r = new BackupRow();
+                                r.Key = p[0];
+                                r.Name = p[1];
+                                r.Value = p[2];
+                                r.Updated = p[3];
+                                rows.Add(r);
+                            }
+                            complete = true;
+                            return rows;
+                        }
                     }
-                    complete = true;
+                    finally { Sqlite.Close(db); }
+                    if (attempt > 0 || !AppDb.IsSchemaError(error)) return rows;
+                    AppDb.ForceReensure();
                 }
-                finally { Sqlite.Close(db); }
             }
             catch (Exception ex) { error = ex.Message; }
             return rows;
@@ -225,32 +237,44 @@ namespace PCTools
         }
 
         // ---------------- 枚举后回填 ----------------
-        internal static void FillStartup(List<StartupItem> list)
+        // complete=false 表示读取失败，不是「库里确实没有基线」。以前四个 Fill 都丢弃
+        // 这个标志直接 ApplyMap，一次瞬时读失败就会把整页改写成「未备份」并把
+        // BackupRank 置 99，用户据此重新备份会把当前值当成基线，原有差异信息全丢。
+        // 返回 false 让枚举侧给出明确告警：本次列可能不可信，别据此重新备份
+        internal static bool FillStartup(List<StartupItem> list)
         {
             bool complete;
             Dictionary<string, string> map = Load(KindFor(0), out complete);
+            if (!complete) return false;
             ApplyMap(0, list, map);
+            return true;
         }
 
-        internal static void FillServices(List<ServiceItem> list)
+        internal static bool FillServices(List<ServiceItem> list)
         {
             bool complete;
             Dictionary<string, string> map = Load(KindFor(1), out complete);
+            if (!complete) return false;
             ApplyMap(1, list, map);
+            return true;
         }
 
-        internal static void FillTasks(List<TaskItem> list)
+        internal static bool FillTasks(List<TaskItem> list)
         {
             bool complete;
             Dictionary<string, string> map = Load(KindFor(2), out complete);
+            if (!complete) return false;
             ApplyMap(2, list, map);
+            return true;
         }
 
-        internal static void FillCtx(List<CtxMenuItem> list)
+        internal static bool FillCtx(List<CtxMenuItem> list)
         {
             bool complete;
             Dictionary<string, string> map = Load(KindFor(3), out complete);
+            if (!complete) return false;
             ApplyMap(3, list, map);
+            return true;
         }
 
         // 备份成功后用内存快照回填：不再开库，也不重新枚举 WMI/COM
@@ -298,6 +322,14 @@ namespace PCTools
             if (map == null) return false;
             string key = KeyFor(page, item);
             if (key != null && map.TryGetValue(key, out value)) return true;
+            // 打包扩展的旧键含包全名（版本/架构/哈希）：应用升级后新键失配，
+            // 先按旧键读回旧基线，避免整列突然变成「未备份」
+            if (page == 3)
+            {
+                CtxMenuItem ci = item as CtxMenuItem;
+                if (ci != null && !string.IsNullOrEmpty(ci.KeyLegacy) &&
+                    map.TryGetValue(ci.KeyLegacy, out value)) return true;
+            }
             if (page != 1) return false;
             ServiceItem si = item as ServiceItem;
             if (si == null || string.IsNullOrEmpty(si.ServiceName)) return false;
@@ -435,6 +467,16 @@ namespace PCTools
             syncBackupChk = false;
         }
 
+        // 当前页正在显示的列表。备份期间可能刚完成一次刷新、列表对象已被替换，
+        // 回填必须打到「当前这一份」上，否则备份成功但界面仍显示旧的「未备份」
+        private IList CurrentPageList(int page)
+        {
+            if (page == 0) return startupData;
+            if (page == 1) return serviceData;
+            if (page == 2) return taskData;
+            return ctxData;
+        }
+
         private void RunBackup(int page)
         {
             if (settingsMode != SettingsNone) return;
@@ -493,7 +535,7 @@ namespace PCTools
                         Dialogs.Info(this, "备份失败", string.IsNullOrEmpty(err) ? "原因未知" : err);
                         return;
                     }
-                    BackupStore.ApplyTo(page, all, rows);
+                    BackupStore.ApplyTo(page, CurrentPageList(page), rows);
                     RepaintItems();
                     if (current == page) ApplyFilter();
                     SetStatus("已备份 " + rows.Count + " 项" + what + "（原备份已覆盖）");

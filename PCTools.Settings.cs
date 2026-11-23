@@ -597,7 +597,7 @@ namespace PCTools
 
             // 用整表保存而不是 c.Save()：后者会以库里的 active 为准，
             // 用户点了「设为当前」再按「保存此配置」就会白点一次
-            if (!AiConfig.SaveAll(profiles, active))
+            if (!AiConfig.SaveAll(profiles, active, 1200))
             {
                 string why = string.IsNullOrEmpty(c.LastError) ? AppDb.LastError : c.LastError;
                 status.Text = "保存失败：" + why +
@@ -608,9 +608,12 @@ namespace PCTools
 
             bool reset = IdentityChanged(c);
             // SaveAll 会写整张表：其它配置在切换列表项时已经被 CommitFields 提交，
-            // 它们的地址/模型/Key 变化也必须清用量，不能只清当前正在编辑的这一套
+            // 它们的地址/模型/Key 变化也必须清用量，不能只清当前正在编辑的这一套。
+            // 合并成一次开库：逐套 Clear 各等一次 500ms busy_timeout，UI 线程会明显卡顿
+            List<int> resetIds = new List<int>();
             foreach (AiConfig p in profiles)
-                if (IdentityChanged(p)) AiUsageStore.Clear(p.Index);
+                if (IdentityChanged(p)) resetIds.Add(p.Index);
+            AiUsageStore.ClearMany(resetIds);
             // 整表快照重取：只更新单项会让 Count 与 original 脱节，Dirty() 之后一直为真
             TakeSnapshot();
             Saved = true;                       // 已经真实写盘，主窗口应提示「已更新」
@@ -664,7 +667,7 @@ namespace PCTools
 
             List<int> before = new List<int>(original.Keys);
 
-            if (!AiConfig.SaveAll(profiles, active))
+            if (!AiConfig.SaveAll(profiles, active, 1200))
             {
                 string why = (profiles.Count > 0 && !string.IsNullOrEmpty(profiles[0].LastError))
                              ? profiles[0].LastError : AppDb.LastError;
@@ -674,15 +677,18 @@ namespace PCTools
                 return false;
             }
 
-            // 被删掉的配置要先清：它的 Index 会被「新增」复用
+            // 被删掉的配置要先清：它的 Index 会被「新增」复用。
+            // 删除项与身份变更合并成一次开库，避免 UI 线程逐套等待 busy_timeout
+            List<int> clearIds = new List<int>();
             foreach (int k in before)
             {
                 bool still = false;
                 foreach (AiConfig c in profiles) if (c.Index == k) still = true;
-                if (!still) AiUsageStore.Clear(k);
+                if (!still) clearIds.Add(k);
             }
             // 地址/模型/Key 改过的配置清零，其余继续累计
-            foreach (AiConfig c in profiles) if (IdentityChanged(c)) AiUsageStore.Clear(c.Index);
+            foreach (AiConfig c in profiles) if (IdentityChanged(c)) clearIds.Add(c.Index);
+            AiUsageStore.ClearMany(clearIds);
 
             Saved = true;
             Action done = SavedChanged;
