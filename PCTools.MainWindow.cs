@@ -1237,9 +1237,10 @@ namespace PCTools
                     Dictionary<string, string> knownFinal = known;
                     Ui((Action)delegate
                     {
+                        bool current = taskId == aiTaskSeq;
                         ReleaseAi(taskId);
-                        if (trigger != null) trigger.IsEnabled = true;
-                        if (!quitting && !closed) ApplyAdviceLabels(page, knownFinal);
+                        if (trigger != null && current) trigger.IsEnabled = true;
+                        if (current && !quitting && !closed) ApplyAdviceLabels(page, knownFinal);
                         UpdateToolbarState();
                     });
                     Ui((Action)delegate
@@ -1341,9 +1342,11 @@ namespace PCTools
                                        Dictionary<string, string> labels, int taskId)
         {
             if (quitting || closed) return;
+            bool current = taskId == aiTaskSeq;
             ReleaseAi(taskId);
-            if (trigger != null) trigger.IsEnabled = true;
-            ApplyAdviceLabels(page, labels);
+            if (trigger != null && current) trigger.IsEnabled = true;
+            // 已有更新的任务在跑：它写入的标签比本次更晚，不能拿旧结果覆盖列表
+            if (current) ApplyAdviceLabels(page, labels);
             ApplyFilter();
 
             if (!string.IsNullOrEmpty(error) && error.StartsWith("已取消", StringComparison.Ordinal))
@@ -1702,9 +1705,10 @@ namespace PCTools
                     pw.MarkWorkerDone();
                     Ui((Action)delegate
                     {
+                        bool current = taskId == aiTaskSeq;
                         ReleaseAi(taskId);
-                        if (trigger != null) trigger.IsEnabled = true;
-                        if (!quitting && !closed && outcome.AdviceError == null)
+                        if (trigger != null && current) trigger.IsEnabled = true;
+                        if (current && !quitting && !closed && outcome.AdviceError == null)
                             ApplyAdviceLabels(page, labels);
                         UpdateToolbarState();
                     });
@@ -1775,7 +1779,10 @@ namespace PCTools
             if (o == null) return;
             if (quitting || closed) return;    // 主窗口正在退出：不刷列表、不弹窗
 
+            bool current = taskId == aiTaskSeq;
             ReleaseAi(taskId);
+            // 更新的任务已启动：旧摘要只代表过去的结果，不要再覆盖列表或弹窗打断
+            if (!current) return;
             // 回填「AI建议」列：只重画本地数据，不重新枚举系统
             if (o.AdviceError == null) ApplyAdviceLabels(page, labels);
             // 内部会按 aiBusy 重算「更新AI分析」按钮的可用性
